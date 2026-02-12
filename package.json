@@ -1,0 +1,36 @@
+{
+  "name": "cryptolotteryapp",
+  "version": "1.0.0",
+  "description": "Decentralized lottery powered by Chainlink VRF, Automation, and Price Feeds",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.js --network sepolia",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "node": "hardhat node",
+    "frontend": "cd frontend && npm run dev",
+    "frontend:build": "cd frontend && npm run build",
+    "frontend:start": "cd frontend && npm start"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Thuto42096/CryptoLotteryApp.git"
+  },
+  "keywords": [
+    "lottery",
+    "blockchain",
+    "chainlink",
+    "vrf",
+    "ethereum",
+    "web3",
+    "dapp"
+  ],
+  "author": "Thuto_R",
+  "license": "MIT",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Thuto42096/CryptoLotteryApp/issues"
+  },
+  "homepage": "https://github.com/Thuto42096/CryptoLotteryApp#readme"
+}
