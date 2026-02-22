@@ -1,29 +1,26 @@
-const hre = require("hardhat");
+import hre from "hardhat";
 
 async function main() {
   console.log("Deploying CryptoLottery contract to Sepolia...");
 
-  // Sepolia Testnet Chainlink Configuration
-  const VRF_COORDINATOR_V2 = "0x8103B0A8A00be2DDC778e6e7eaa21791Cd364625";
-  const GAS_LANE = "0x474e34a077df58807dbe9c96d3c009b23b3c6d0cce433e59bbf5b34f823bc56c";
-  const CALLBACK_GAS_LIMIT = 500000;
-  const SUBSCRIPTION_ID = process.env.VRF_SUBSCRIPTION_ID || 0; // You need to create this
-  const ETH_USD_PRICE_FEED = "0x694AA1769357215DE4FAC081bf1f309aDC325306";
+  // Sepolia Testnet Chainlink VRF v2.5 Configuration
+  // The VRF Coordinator is hardcoded in the contract: 0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B
+  const SUBSCRIPTION_ID = process.env.VRF_SUBSCRIPTION_ID ? BigInt(process.env.VRF_SUBSCRIPTION_ID) : 0n;
 
-  if (SUBSCRIPTION_ID === 0) {
+  if (SUBSCRIPTION_ID === 0n || !process.env.VRF_SUBSCRIPTION_ID) {
     console.log("\n⚠️  WARNING: VRF_SUBSCRIPTION_ID not set in .env file!");
     console.log("Please create a VRF subscription at https://vrf.chain.link/");
     console.log("And add VRF_SUBSCRIPTION_ID to your .env file\n");
+    console.log("Continuing with SUBSCRIPTION_ID = 0 (you'll need to update this later)\n");
   }
 
+  console.log("Deployment Configuration:");
+  console.log("- VRF Coordinator: 0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B (hardcoded in contract)");
+  console.log("- Subscription ID:", SUBSCRIPTION_ID.toString());
+  console.log("");
+
   const CryptoLottery = await hre.ethers.getContractFactory("CryptoLottery");
-  const lottery = await CryptoLottery.deploy(
-    VRF_COORDINATOR_V2,
-    SUBSCRIPTION_ID,
-    GAS_LANE,
-    CALLBACK_GAS_LIMIT,
-    ETH_USD_PRICE_FEED
-  );
+  const lottery = await CryptoLottery.deploy(SUBSCRIPTION_ID);
 
   await lottery.waitForDeployment();
   const address = await lottery.getAddress();
@@ -46,13 +43,7 @@ async function main() {
     try {
       await hre.run("verify:verify", {
         address: address,
-        constructorArguments: [
-          VRF_COORDINATOR_V2,
-          SUBSCRIPTION_ID,
-          GAS_LANE,
-          CALLBACK_GAS_LIMIT,
-          ETH_USD_PRICE_FEED,
-        ],
+        constructorArguments: [SUBSCRIPTION_ID.toString()],
       });
       console.log("✅ Contract verified on Etherscan");
     } catch (error) {

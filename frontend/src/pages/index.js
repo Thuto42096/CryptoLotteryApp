@@ -3,11 +3,11 @@ import Head from 'next/head';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { parseEther, formatEther } from 'viem';
-import { CONTRACT_ADDRESS, CONTRACT_ABI } from '@/utils/contract';
-import TicketSelector from '@/components/TicketSelector';
-import DrawHistory from '@/components/DrawHistory';
-import MyTickets from '@/components/MyTickets';
-import PrizePool from '@/components/PrizePool';
+import { CONTRACT_ADDRESS, CONTRACT_ABI } from '../utils/contract';
+import TicketSelector from '../components/TicketSelector';
+import DrawHistory from '../components/DrawHistory';
+import MyTickets from '../components/MyTickets';
+import PrizePool from '../components/PrizePool';
 
 export default function Home() {
   const { address, isConnected } = useAccount();
@@ -18,27 +18,45 @@ export default function Home() {
   const { data: currentDraw } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: CONTRACT_ABI,
-    functionName: 'getCurrentDrawNumber',
+    functionName: 'currentRoundId',
   });
 
   const { data: prizePool } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: CONTRACT_ABI,
-    functionName: 'getPrizePool',
+    functionName: 'prizePool',
   });
 
   const { data: ticketPrice } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: CONTRACT_ABI,
-    functionName: 'getTicketPrice',
+    functionName: 'TICKET_PRICE',
   });
 
-  const { data: timeUntilDraw } = useReadContract({
+  const { data: roundEndTime } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: CONTRACT_ABI,
-    functionName: 'getTimeUntilDraw',
+    functionName: 'roundEndTime',
     watch: true,
   });
+
+  // Calculate time until draw from roundEndTime
+  const [timeUntilDraw, setTimeUntilDraw] = useState(0);
+
+  useEffect(() => {
+    if (!roundEndTime) return;
+
+    const updateTimer = () => {
+      const now = Math.floor(Date.now() / 1000);
+      const endTime = Number(roundEndTime);
+      const remaining = Math.max(0, endTime - now);
+      setTimeUntilDraw(remaining);
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [roundEndTime]);
 
   const { writeContract, data: hash } = useWriteContract();
   const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash });
@@ -55,28 +73,30 @@ export default function Home() {
   };
 
   const handleBuyTickets = async () => {
-    if (tickets.length === 0) return;
+    if (tickets.length === 0) {
+      console.log('No tickets to buy');
+      return;
+    }
+
+    console.log('Buying ticket with numbers:', tickets[0]);
+    console.log('Ticket price:', ticketPrice?.toString());
+    console.log('Contract address:', CONTRACT_ADDRESS);
 
     try {
-      if (tickets.length === 1) {
-        writeContract({
-          address: CONTRACT_ADDRESS,
-          abi: CONTRACT_ABI,
-          functionName: 'buyTicket',
-          args: [tickets[0]],
-          value: ticketPrice,
-        });
-      } else {
-        writeContract({
-          address: CONTRACT_ADDRESS,
-          abi: CONTRACT_ABI,
-          functionName: 'buyMultipleTickets',
-          args: [tickets],
-          value: ticketPrice * BigInt(tickets.length),
-        });
-      }
+      // The contract only supports buying one ticket at a time with the enter() function
+      // For now, we'll just buy the first ticket
+      // TODO: Implement sequential ticket purchases or update contract to support batch purchases
+      writeContract({
+        address: CONTRACT_ADDRESS,
+        abi: CONTRACT_ABI,
+        functionName: 'enter',
+        args: [tickets[0]],
+        value: ticketPrice,
+      });
+      console.log('Transaction submitted');
     } catch (error) {
       console.error('Error buying tickets:', error);
+      alert('Error buying ticket: ' + error.message);
     }
   };
 
@@ -206,11 +226,19 @@ export default function Home() {
                         ))}
                       </div>
 
+                      {tickets.length > 1 && (
+                        <div className="mb-4 bg-yellow-500 bg-opacity-20 border border-yellow-500 rounded-lg p-4">
+                          <p className="text-yellow-400 font-semibold">
+                            ⚠️ Note: Currently only the first ticket will be purchased. Multiple ticket purchases coming soon!
+                          </p>
+                        </div>
+                      )}
+
                       <div className="mt-6 flex items-center justify-between">
                         <div className="text-white">
-                          <p className="text-sm text-gray-300">Total Cost</p>
+                          <p className="text-sm text-gray-300">Cost per Ticket</p>
                           <p className="text-2xl font-bold">
-                            {ticketPrice ? formatEther(ticketPrice * BigInt(tickets.length)) : '0'} ETH
+                            {ticketPrice ? formatEther(ticketPrice) : '0'} ETH
                           </p>
                         </div>
                         <button
@@ -218,13 +246,13 @@ export default function Home() {
                           disabled={isConfirming}
                           className="bg-gradient-to-r from-yellow-400 to-orange-500 text-white px-8 py-3 rounded-lg font-bold text-lg hover:from-yellow-500 hover:to-orange-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                         >
-                          {isConfirming ? 'Confirming...' : 'Buy Tickets'}
+                          {isConfirming ? 'Confirming...' : 'Buy Ticket'}
                         </button>
                       </div>
 
                       {isConfirmed && (
                         <div className="mt-4 bg-green-500 bg-opacity-20 border border-green-500 rounded-lg p-4">
-                          <p className="text-green-400 font-semibold">✅ Tickets purchased successfully!</p>
+                          <p className="text-green-400 font-semibold">✅ Ticket purchased successfully!</p>
                         </div>
                       )}
                     </div>

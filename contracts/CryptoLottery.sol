@@ -1,368 +1,216 @@
 // SPDX-License-Identifier: MIT
+
 pragma solidity ^0.8.19;
 
-import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
-import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
-import "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
-contract CryptoLottery is VRFConsumerBaseV2, AutomationCompatibleInterface {
-    // Chainlink VRF Variables
-    VRFCoordinatorV2Interface private immutable i_vrfCoordinator;
-    uint64 private immutable i_subscriptionId;
-    bytes32 private immutable i_gasLane;
-    uint32 private immutable i_callbackGasLimit;
-    uint16 private constant REQUEST_CONFIRMATIONS = 3;
-    uint32 private constant NUM_WORDS = 7;
+contract CryptoLottery is VRFConsumerBaseV2Plus {
+  event RequestSent(uint256 requestId, uint32 numWords);
+  event RequestFulfilled(uint256 requestId, uint256[] randomWords);
+  event Entered(address indexed player, uint256[] numbers);
+  event WinnersPaid(uint256 matchCount, uint256 winnerCount, uint256 totalPayout);
+  event RoundEnded(uint256 roundId, uint256 rolledOverPot);
 
-    // Chainlink Price Feed
-    AggregatorV3Interface private immutable i_priceFeed;
+  struct RequestStatus {
+    bool fulfilled; // whether the request has been successfully fulfilled
+    bool exists; // whether a requestId exists
+    uint256[] randomWords;
+  }
 
-    // Lottery Variables
-    uint256 private constant TICKET_PRICE = 0.01 ether;
-    uint256 private constant DRAW_INTERVAL = 1 days;
-    uint256 private constant FEE_PERCENTAGE = 10;
-    uint256 private constant PRIZE_PER_MATCH = 5; // 5% per correct position
+  mapping(uint256 => RequestStatus) public s_requests; /* requestId --> requestStatus */
+
+  // Your subscription ID.
+  uint256 public s_subscriptionId;
+
+  // Past request IDs.
+  uint256[] public requestIds;
+  uint256 public lastRequestId;
+
+  // Lottery State
+  uint256 public constant TICKET_PRICE = 0.000000005 ether; // 5 Gwei for testing
+  uint256 public constant ROUND_DURATION = 5 minutes;
+  uint256 public roundEndTime;
+  uint256 public prizePool;
+  uint256 public ownerFees;
+  uint256 public currentRoundId;
+  
+  mapping(address => uint256) public lastPlayedRound;
+
+  // The gas lane to use, which specifies the maximum gas price to bump to.
+  // For a list of available gas lanes on each network,
+  // see https://docs.chain.link/vrf/v2-5/supported-networks
+  bytes32 public keyHash = 0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae;
+
+  // Depends on the number of requested values that you want sent to the
+  // fulfillRandomWords() function. Storing each word costs about 20,000 gas,
+  // so 100,000 is a safe default for this example contract. Test and adjust
+  // this limit based on the network that you select, the size of the request,
+  // and the processing of the callback request in the fulfillRandomWords()
+  // function.
+  uint32 public callbackGasLimit = 2_500_000;
+
+  // The default is 3, but you can set this higher.
+  uint16 public requestConfirmations = 3;
+
+  // For this example, retrieve 7 random values in one request.
+  // Cannot exceed VRFCoordinatorV2_5.MAX_NUM_WORDS.
+  uint32 public numWords = 7;
+
+  struct Ticket {
+    address player;
+    uint256 numbers; // Packed 7 numbers (1 byte each)
+  }
+
+  Ticket[] public tickets;
+
+  /**
+   * HARDCODED FOR SEPOLIA
+   * COORDINATOR: 0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B
+   */
+  constructor(
+    uint256 subscriptionId
+  ) VRFConsumerBaseV2Plus(0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B) {
+    s_subscriptionId = subscriptionId;
+  }
+
+  function enter(uint256[] calldata numbers) external payable {
+    require(msg.sender != owner(), "Owner cannot enter");
+    require(msg.value == TICKET_PRICE, "Incorrect ETH amount");
+    require(lastPlayedRound[msg.sender] != currentRoundId + 1, "Already joined this round");
+    require(numbers.length == 7, "Must choose 7 numbers");
     
-    address private immutable i_owner;
-    uint256 private s_lastDrawTimestamp;
-    uint256 private s_drawNumber;
-    uint256 private s_prizePool;
-    uint256 private s_accumulatedFees;
+    uint256 packed;
+    for(uint256 i = 0; i < 7; i++) {
+        require(numbers[i] >= 1 && numbers[i] <= 49, "Number out of range (1-49)");
+        packed |= numbers[i] << (i * 8);
+    }
+
+    // Start timer if first player
+    if (tickets.length == 0) {
+        roundEndTime = block.timestamp + ROUND_DURATION;
+    } else {
+        require(block.timestamp < roundEndTime, "Round ended, wait for draw");
+    }
+
+    // 10% to owner, 90% to prize pool
+    uint256 fee = (msg.value * 10) / 100;
+    ownerFees += fee;
+    prizePool += (msg.value - fee);
+
+    lastPlayedRound[msg.sender] = currentRoundId + 1; // Use +1 to distinguish from default 0
+    tickets.push(Ticket({player: msg.sender, numbers: packed}));
     
-    enum LotteryState {
-        OPEN,
-        CALCULATING
-    }
-    LotteryState private s_lotteryState;
+    emit Entered(msg.sender, numbers);
+  }
 
-    struct Ticket {
-        address player;
-        uint8[7] numbers;
-        uint256 drawNumber;
-        uint256 timestamp;
-    }
+  function pickWinner() external returns (uint256 requestId) {
+    require(tickets.length > 0, "No players in pool");
+    require(block.timestamp >= roundEndTime, "Round not finished");
 
-    struct Draw {
-        uint8[7] winningNumbers;
-        uint256 timestamp;
-        uint256 prizePool;
-        uint256 totalTickets;
-    }
+    // Will revert if subscription is not set and funded.
+    requestId = s_vrfCoordinator.requestRandomWords(
+      VRFV2PlusClient.RandomWordsRequest({
+        keyHash: keyHash,
+        subId: s_subscriptionId,
+        requestConfirmations: requestConfirmations,
+        callbackGasLimit: callbackGasLimit,
+        numWords: numWords,
+        extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: false}))
+      })
+    );
+    s_requests[requestId] = RequestStatus({randomWords: new uint256[](0), exists: true, fulfilled: false});
+    requestIds.push(requestId);
+    lastRequestId = requestId;
+    emit RequestSent(requestId, numWords);
+    return requestId;
+  }
 
-    mapping(uint256 => Ticket[]) private s_ticketsByDraw;
-    mapping(uint256 => Draw) private s_draws;
-    mapping(address => uint256[]) private s_playerTicketIds;
-    mapping(uint256 => mapping(uint256 => uint256)) private s_ticketIdByDrawAndIndex;
+  function fulfillRandomWords(
+    uint256 _requestId,
+    uint256[] calldata _randomWords
+  ) internal override {
+    require(s_requests[_requestId].exists, "request not found");
+    s_requests[_requestId].fulfilled = true;
+
+    // Generate winning numbers
+    uint256[] memory lottoResult = new uint256[](7);
+    for (uint256 i = 0; i < 7; i++) {
+      lottoResult[i] = (_randomWords[i] % 49) + 1;
+    }
+    s_requests[_requestId].randomWords = lottoResult;
+    emit RequestFulfilled(_requestId, lottoResult);
+
+    // Distribute Rewards
+    distributeRewards(lottoResult);
+
+    // Reset for next round
+    delete tickets;
+    roundEndTime = 0;
+    currentRoundId++;
+    emit RoundEnded(currentRoundId, prizePool);
+  }
+
+  function distributeRewards(uint256[] memory winningNumbers) internal {
+    uint256 currentPot = prizePool;
+    // Percentages: 1->0%, 2->5%, 3->10%, 4->15%, 5->20%, 6->20%, 7->30%
+    uint256[8] memory percentages = [uint256(0), 0, 5, 10, 15, 20, 20, 30];
     
-    uint256 private s_totalTickets;
-
-    // Events
-    event TicketPurchased(address indexed player, uint256 indexed drawNumber, uint256 ticketId, uint8[7] numbers);
-    event DrawRequested(uint256 indexed drawNumber, uint256 requestId);
-    event DrawCompleted(uint256 indexed drawNumber, uint8[7] winningNumbers);
-    event PrizeWon(address indexed player, uint256 indexed drawNumber, uint256 ticketId, uint256 prize, uint8 matches);
-    event FeesWithdrawn(address indexed owner, uint256 amount);
-
-    constructor(
-        address vrfCoordinatorV2,
-        uint64 subscriptionId,
-        bytes32 gasLane,
-        uint32 callbackGasLimit,
-        address priceFeed
-    ) VRFConsumerBaseV2(vrfCoordinatorV2) {
-        i_vrfCoordinator = VRFCoordinatorV2Interface(vrfCoordinatorV2);
-        i_subscriptionId = subscriptionId;
-        i_gasLane = gasLane;
-        i_callbackGasLimit = callbackGasLimit;
-        i_priceFeed = AggregatorV3Interface(priceFeed);
-        i_owner = msg.sender;
-        s_lastDrawTimestamp = block.timestamp;
-        s_lotteryState = LotteryState.OPEN;
-        s_drawNumber = 1;
-    }
-
-    function buyTicket(uint8[7] memory numbers) external payable {
-        require(s_lotteryState == LotteryState.OPEN, "Lottery is not open");
-        require(msg.value == TICKET_PRICE, "Incorrect ticket price");
-        require(isValidTicket(numbers), "Invalid ticket numbers");
-
-        uint256 ticketId = s_totalTickets;
-        s_totalTickets++;
-
-        Ticket memory newTicket = Ticket({
-            player: msg.sender,
-            numbers: numbers,
-            drawNumber: s_drawNumber,
-            timestamp: block.timestamp
-        });
-
-        s_ticketsByDraw[s_drawNumber].push(newTicket);
-        s_playerTicketIds[msg.sender].push(ticketId);
-        s_ticketIdByDrawAndIndex[s_drawNumber][s_ticketsByDraw[s_drawNumber].length - 1] = ticketId;
-
-        // Add to prize pool (90% of ticket price, 10% fee)
-        uint256 fee = (msg.value * FEE_PERCENTAGE) / 100;
-        s_accumulatedFees += fee;
-        s_prizePool += msg.value - fee;
-
-        emit TicketPurchased(msg.sender, s_drawNumber, ticketId, numbers);
-    }
-
-    function buyMultipleTickets(uint8[7][] memory ticketsNumbers) external payable {
-        require(s_lotteryState == LotteryState.OPEN, "Lottery is not open");
-        require(msg.value == TICKET_PRICE * ticketsNumbers.length, "Incorrect total price");
-
-        for (uint256 i = 0; i < ticketsNumbers.length; i++) {
-            require(isValidTicket(ticketsNumbers[i]), "Invalid ticket numbers");
-            
-            uint256 ticketId = s_totalTickets;
-            s_totalTickets++;
-
-            Ticket memory newTicket = Ticket({
-                player: msg.sender,
-                numbers: ticketsNumbers[i],
-                drawNumber: s_drawNumber,
-                timestamp: block.timestamp
-            });
-
-            s_ticketsByDraw[s_drawNumber].push(newTicket);
-            s_playerTicketIds[msg.sender].push(ticketId);
-            s_ticketIdByDrawAndIndex[s_drawNumber][s_ticketsByDraw[s_drawNumber].length - 1] = ticketId;
-
-            emit TicketPurchased(msg.sender, s_drawNumber, ticketId, ticketsNumbers[i]);
-        }
-
-        uint256 totalFee = (msg.value * FEE_PERCENTAGE) / 100;
-        s_accumulatedFees += totalFee;
-        s_prizePool += msg.value - totalFee;
-    }
-
-    function isValidTicket(uint8[7] memory numbers) private pure returns (bool) {
-        // Check if numbers are in range 1-49 and in ascending order
-        for (uint256 i = 0; i < 7; i++) {
-            if (numbers[i] < 1 || numbers[i] > 49) {
-                return false;
-            }
-            if (i > 0 && numbers[i] <= numbers[i - 1]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // Chainlink Automation - Check if upkeep is needed
-    function checkUpkeep(bytes memory /* checkData */)
-        public
-        view
-        override
-        returns (bool upkeepNeeded, bytes memory /* performData */)
-    {
-        bool timePassed = (block.timestamp - s_lastDrawTimestamp) >= DRAW_INTERVAL;
-        bool isOpen = s_lotteryState == LotteryState.OPEN;
-        bool hasTickets = s_ticketsByDraw[s_drawNumber].length > 0;
-        upkeepNeeded = timePassed && isOpen && hasTickets;
-        return (upkeepNeeded, "0x0");
-    }
-
-    // Chainlink Automation - Perform upkeep
-    function performUpkeep(bytes calldata /* performData */) external override {
-        (bool upkeepNeeded, ) = checkUpkeep("");
-        require(upkeepNeeded, "Upkeep not needed");
-
-        s_lotteryState = LotteryState.CALCULATING;
-
-        uint256 requestId = i_vrfCoordinator.requestRandomWords(
-            i_gasLane,
-            i_subscriptionId,
-            REQUEST_CONFIRMATIONS,
-            i_callbackGasLimit,
-            NUM_WORDS
-        );
-
-        emit DrawRequested(s_drawNumber, requestId);
-    }
-
-    // Chainlink VRF Callback
-    function fulfillRandomWords(uint256 /* requestId */, uint256[] memory randomWords)
-        internal
-        override
-    {
-        uint8[7] memory winningNumbers = generateWinningNumbers(randomWords);
-
-        s_draws[s_drawNumber] = Draw({
-            winningNumbers: winningNumbers,
-            timestamp: block.timestamp,
-            prizePool: s_prizePool,
-            totalTickets: s_ticketsByDraw[s_drawNumber].length
-        });
-
-        emit DrawCompleted(s_drawNumber, winningNumbers);
-
-        // Process winners and distribute prizes
-        distributeWinnings(s_drawNumber, winningNumbers);
-
-        // Reset for next draw
-        s_drawNumber++;
-        s_lastDrawTimestamp = block.timestamp;
-        s_prizePool = 0;
-        s_lotteryState = LotteryState.OPEN;
-    }
-
-    function generateWinningNumbers(uint256[] memory randomWords)
-        private
-        pure
-        returns (uint8[7] memory)
-    {
-        uint8[7] memory numbers;
-        bool[50] memory used; // Track used numbers (index 0 unused, 1-49 used)
-
-        for (uint256 i = 0; i < 7; i++) {
-            uint8 number;
-            do {
-                number = uint8((randomWords[i] % 49) + 1);
-            } while (used[number]);
-
-            used[number] = true;
-            numbers[i] = number;
-        }
-
-        // Sort numbers in ascending order
-        sortNumbers(numbers);
-        return numbers;
-    }
-
-    function sortNumbers(uint8[7] memory numbers) private pure {
-        for (uint256 i = 0; i < 7; i++) {
-            for (uint256 j = i + 1; j < 7; j++) {
-                if (numbers[i] > numbers[j]) {
-                    uint8 temp = numbers[i];
-                    numbers[i] = numbers[j];
-                    numbers[j] = temp;
-                }
-            }
-        }
-    }
-
-    function distributeWinnings(uint256 drawNumber, uint8[7] memory winningNumbers) private {
-        Ticket[] memory tickets = s_ticketsByDraw[drawNumber];
-        uint256 drawPrizePool = s_draws[drawNumber].prizePool;
-
-        for (uint256 i = 0; i < tickets.length; i++) {
-            uint8 matches = countMatches(tickets[i].numbers, winningNumbers);
-
-            if (matches > 0) {
-                uint256 prize = (drawPrizePool * PRIZE_PER_MATCH * matches) / 100;
-
-                if (prize > 0) {
-                    (bool success, ) = payable(tickets[i].player).call{value: prize}("");
-                    if (success) {
-                        uint256 ticketId = s_ticketIdByDrawAndIndex[drawNumber][i];
-                        emit PrizeWon(tickets[i].player, drawNumber, ticketId, prize, matches);
-                    }
-                }
-            }
-        }
-    }
-
-    function countMatches(uint8[7] memory ticketNumbers, uint8[7] memory winningNumbers)
-        private
-        pure
-        returns (uint8)
-    {
-        uint8 matches = 0;
-        for (uint256 i = 0; i < 7; i++) {
-            if (ticketNumbers[i] == winningNumbers[i]) {
+    // Track winners per tier to split the share
+    uint256[8] memory winnerCounts;
+    uint8[] memory matchesPerTicket = new uint8[](tickets.length);
+    
+    // First pass: count winners for each tier
+    for (uint256 i = 0; i < tickets.length; i++) {
+        uint256 packed = tickets[i].numbers;
+        uint256 matches = 0;
+        for (uint256 j = 0; j < 7; j++) {
+            if (((packed >> (j * 8)) & 0xFF) == winningNumbers[j]) {
                 matches++;
             }
         }
-        return matches;
-    }
-
-    // View functions
-    function getCurrentDrawNumber() external view returns (uint256) {
-        return s_drawNumber;
-    }
-
-    function getPrizePool() external view returns (uint256) {
-        return s_prizePool;
-    }
-
-    function getPrizePoolInUSD() external view returns (uint256) {
-        (, int256 price, , , ) = i_priceFeed.latestRoundData();
-        uint256 ethPriceInUSD = uint256(price) * 1e10; // Price feed returns 8 decimals
-        return (s_prizePool * ethPriceInUSD) / 1e18;
-    }
-
-    function getTicketPrice() external pure returns (uint256) {
-        return TICKET_PRICE;
-    }
-
-    function getDrawInterval() external pure returns (uint256) {
-        return DRAW_INTERVAL;
-    }
-
-    function getLotteryState() external view returns (LotteryState) {
-        return s_lotteryState;
-    }
-
-    function getTimeUntilDraw() external view returns (uint256) {
-        uint256 timePassed = block.timestamp - s_lastDrawTimestamp;
-        if (timePassed >= DRAW_INTERVAL) {
-            return 0;
+        matchesPerTicket[i] = uint8(matches);
+        if (matches > 0) {
+            winnerCounts[matches]++;
         }
-        return DRAW_INTERVAL - timePassed;
     }
 
-    function getDraw(uint256 drawNumber) external view returns (Draw memory) {
-        return s_draws[drawNumber];
-    }
+    // Second pass: distribute
+    // We iterate tickets again to pay out. 
+    // Note: In production with many users, this loop pattern can hit gas limits. 
+    // Consider Claim pattern for scalability.
+    for (uint256 i = 0; i < tickets.length; i++) {
+        uint256 matches = matchesPerTicket[i];
 
-    function getTicketsForDraw(uint256 drawNumber) external view returns (Ticket[] memory) {
-        return s_ticketsByDraw[drawNumber];
-    }
-
-    function getPlayerTickets(address player) external view returns (uint256[] memory) {
-        return s_playerTicketIds[player];
-    }
-
-    function getTicketsByDrawForPlayer(address player, uint256 drawNumber)
-        external
-        view
-        returns (Ticket[] memory)
-    {
-        Ticket[] memory allTickets = s_ticketsByDraw[drawNumber];
-        uint256 count = 0;
-
-        for (uint256 i = 0; i < allTickets.length; i++) {
-            if (allTickets[i].player == player) {
-                count++;
+        if (matches >= 2) {
+            // Calculate share for this tier
+            uint256 tierShare = (currentPot * percentages[matches]) / 100;
+            // Split among winners of this tier
+            uint256 payout = tierShare / winnerCounts[matches];
+            
+            if (payout > 0) {
+                prizePool -= payout;
+                payable(tickets[i].player).transfer(payout);
+                (bool success, ) = payable(tickets[i].player).call{value: payout}("");
+                require(success, "Transfer failed");
             }
         }
-
-        Ticket[] memory playerTickets = new Ticket[](count);
-        uint256 index = 0;
-
-        for (uint256 i = 0; i < allTickets.length; i++) {
-            if (allTickets[i].player == player) {
-                playerTickets[index] = allTickets[i];
-                index++;
-            }
-        }
-
-        return playerTickets;
     }
+    // Any undistributed prizePool (due to no winners in a tier) remains for next round.
+  }
 
-    function withdrawFees() external {
-        require(msg.sender == i_owner, "Only owner can withdraw fees");
-        uint256 amount = s_accumulatedFees;
-        s_accumulatedFees = 0;
+  function getRequestStatus(
+    uint256 _requestId
+  ) external view returns (bool fulfilled, uint256[] memory randomWords) {
+    require(s_requests[_requestId].exists, "request not found");
+    RequestStatus memory request = s_requests[_requestId];
+    return (request.fulfilled, request.randomWords);
+  }
 
-        (bool success, ) = payable(i_owner).call{value: amount}("");
-        require(success, "Transfer failed");
-
-        emit FeesWithdrawn(i_owner, amount);
-    }
-
-    receive() external payable {}
+  function withdrawOwnerFees() external onlyOwner {
+      uint256 amount = ownerFees;
+      ownerFees = 0;
+      (bool success, ) = payable(msg.sender).call{value: amount}("");
+      require(success, "Transfer failed");
+  }
 }
